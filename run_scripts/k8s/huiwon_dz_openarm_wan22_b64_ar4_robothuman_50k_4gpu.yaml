@@ -1,0 +1,190 @@
+# ==============================================================================================
+# DreamZero OpenArm (ROBOT + HUMAN co-training, human video-only) — Wan2.2-TI2V-5B FULL fine-tune — MLXP single node, 4x H200,
+# AR max_chunk_size=4 (33 frames / 96 actions / 4 states per sample), eff. batch 64, 50K steps
+# ----------------------------------------------------------------------------------------------
+#   repo     : /data/huiwon/dreamzero, branch huiwon/openarm (github dreamzero0/dreamzero @ ab790c1 + our patches;
+#              own .venv, python 3.11, torch 2.8, deepspeed 0.19.6). Adapter design: run_scripts/README_openarm.md
+#   launcher : run_scripts/train/dz_openarm_wan22_ar4_50k.sh  (DZ_VARIANT=robothuman)
+#   data     : /data/huiwon/data/openarm_wam_v1 (6 robot + 5 human subsets, robot:human = 0.5:0.5 in expectation); data=dreamzero/openarm_human_wan22
+#              two ego views 144x192 each, stacked vertically -> 288x192 canvas (frame_seqlen 54); state/action 28-dim,
+#              arms relative to the chunk-anchor state, neck/hands absolute; q01/q99 normalization (pooled stats.json +
+#              pooled relative_stats_dreamzero.json). fps 20/30 mixed (chunk = 24 frames = 1.2 s / 0.8 s).
+#   recipe   : upstream DROID full-FT defaults: lr 1e-5 · warmup_ratio 0.05 (2500 steps) · wd 1e-5 · cosine to 0
+#              (NOT our min_lr 0.1 rule) · adam (0.95, 0.999) · bf16+tf32 · deepspeed zero2_offload · GC on.
+#   plate    : PLATE_PD x 4 gpu x PLATE_GA must equal 64 (launcher gate). Default pd8 GA2.
+#              OOM fallback: edit spec.env PLATE_PD=4 PLATE_GA=4 (same global batch, unchanged optimizer steps).
+#   save     : every 1000 optimizer steps, keep 5 (~100 GB each with ZeRO-2 optimizer state => ~0.5 TB resident).
+#              Auto-resume: experiment/base.py:644 picks the highest checkpoint-N in the FIXED output dir.
+#   ckpt     : $MODEL_OUTPUT_DIR/dz_openarm_wam_v1_robothuman_b32_ar4_50k/checkpoint-N
+#   logs     : /data/huiwon/logs/gr00t-vdm/dz-oav1-wan22-b64-ar4-rh-50k-4gpu-<ts>.{out,err}
+#   backoff  : backoffLimit 50 — node h200-03-w-274e has a broken /data mount; a pod landing there dies at
+#              "FATAL no clone" within seconds and the Job retries elsewhere (fail-fast kept on purpose).
+#   NOT GPU-tested (written 2026-09-16; CPU data smoke + hydra compose + server dry-run only).
+#   Smoke witnesses to grep on the first run:
+#     "[batch] robothuman: global=64 = 4 gpu x pd8 x GA2", "[data] robothuman: 11 subsets OK",
+#     "FAILURES: 0" (compose preflight), "[black-view] ... -> black frames" (robothuman only),
+#     "Loading relative action stats from .../meta/relative_stats_dreamzero.json" (lerobot.py:485),
+#     "Set global batch size to 64, set gradient accumulation steps to 2" (base.py:767),
+#     "[resume] latest checkpoint in OUTPUT_DIR: none (fresh run from step 0)", "videos torch.Size([8, 3, 33, 288, 192])".
+# ==============================================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: huiwon-dz-oav1-wan22-b64-ar4-rh-50k-4gpu
+  namespace: p-rlwrld
+  labels:
+    mlxp/job-class: normal
+    project-code: sub_wam
+    project-short-name: sub_wam
+spec:
+  backoffLimit: 50
+  ttlSecondsAfterFinished: 300
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      annotations:
+        # BOTH zone markers are load-bearing: without the zone annotation the MLXP pod-admission
+        # webhook falls back to zone "test" and denies every pod (FailedCreate loop).
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+        sidecar.istio.io/inject: "false"
+      labels:
+        mlxp/job-class: normal
+        project-code: sub_wam
+        project-short-name: sub_wam
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        mlx.navercorp.com/hardware-type: gpu
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+      # No kubernetes.io/hostname affinity on purpose (MLXP resource convention 2026-09-06).
+      imagePullSecrets:
+        - name: mlxp-registry
+      volumes:
+        - name: ddn
+          persistentVolumeClaim:
+            claimName: ddn-rlwrld-shared
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Gi
+      containers:
+        - name: train
+          image: mlxp.kr.ncr.ntruss.com/taeyoung/groot:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            # MLXP enforcement: MODEL_OUTPUT_DIR MUST be a spec.env literal (a container-side export is
+            # not seen by the scheduler check -> suspend-kill).
+            - name: MODEL_OUTPUT_DIR
+              value: /data/rlwrld-unified-checkpoints/huiwon/dreamzero
+            - name: DZ_VARIANT
+              value: "robothuman"
+            # plate knobs (launcher gate: PLATE_PD*4*PLATE_GA == 64). OOM fallback: PLATE_PD=4 PLATE_GA=4
+            - name: PLATE_PD
+              value: "8"
+            - name: PLATE_GA
+              value: "2"
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: GLOO_SOCKET_FAMILY
+              value: AF_INET
+            - name: LD_PRELOAD
+              value: /data/libipv4_force_v2.so
+            - name: NCCL_IB_HCA
+              value: "mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              TAG=dz-oav1-wan22-b64-ar4-rh-50k-4gpu
+              mkdir -p /data/huiwon/logs/gr00t-vdm /data/huiwon/tmp
+              L=/data/huiwon/logs/gr00t-vdm/$TAG-$(date +%Y%m%d_%H%M%S)
+              exec > >(tee -a "$L.out") 2> >(tee -a "$L.err" >&2)
+              echo "[$TAG] START $(date -u +%FT%TZ) pod=$HOSTNAME node=${NODE_NAME:-?}"
+              rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/*nvidia*.list 2>/dev/null || true
+              APT_OK=0
+              for i in 1 2 3; do apt-get update -qq && apt-get install -y ffmpeg iproute2 libibverbs-dev ibverbs-utils && { APT_OK=1; break; }; echo "apt retry $i"; sleep 15; done
+              [ "$APT_OK" = 1 ] || { echo "FATAL apt/ffmpeg"; exit 1; }
+              export UV_CACHE_DIR=/data/huiwon/.uv-cache UV_PYTHON_INSTALL_DIR=/data/huiwon/.uv-python
+              export TMPDIR=/data/huiwon/tmp
+              command -v uv >/dev/null 2>&1 || (curl -LsSf https://astral.sh/uv/install.sh | sh)
+              export PATH="$HOME/.local/bin:$PATH"
+              # ── repo: the dedicated dreamzero clone (its OWN .venv; every other /data/huiwon/* clone untouched) ──
+              # "FATAL no clone" = /data not mounted on this node (h200-03-w-274e) -> exit fast, backoffLimit retries elsewhere
+              export BASE_DIR=/data/huiwon/dreamzero
+              cd "$BASE_DIR" || { echo "FATAL no clone $BASE_DIR"; exit 1; }
+              echo "[$TAG] branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo nogit) HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+              test -d groot/vla || { echo "FATAL $BASE_DIR is not a dreamzero checkout"; exit 1; }
+              # the openarm adapter must be checked out (branch huiwon/openarm); refuse to run a clone without it
+              test -f groot/vla/configs/data/dreamzero/openarm_wan22.yaml || { echo "FATAL clone has no openarm adapter (checkout huiwon/openarm)"; exit 1; }
+              grep -q "OPENARM_HUMAN" groot/vla/data/schema/embodiment_tags.py || { echo "FATAL clone has no openarm embodiment tags"; exit 1; }
+              SCRIPT=run_scripts/train/dz_openarm_wan22_ar4_50k.sh
+              test -f "$SCRIPT" || { echo "FATAL missing launcher $SCRIPT"; exit 1; }
+              bash -n "$SCRIPT" || { echo "FATAL launcher syntax"; exit 1; }
+              # ══ env: python 3.11 venv in the clone (uv.lock pins deepspeed 0.19.6); idempotent when already built ══
+              uv sync --python 3.11 || { echo FAIL_envsetup_sync; exit 1; }
+              uv pip install -e . --no-deps || { echo FAIL_envsetup_editable; exit 1; }
+              export DZ_PYTHON="$BASE_DIR/.venv/bin/python"
+              test -x "$DZ_PYTHON" || { echo "FATAL no venv python at $DZ_PYTHON"; exit 1; }
+              echo "[$TAG] python=$("$DZ_PYTHON" -V 2>&1)"
+              case "$("$DZ_PYTHON" -V 2>&1)" in *" 3.11."*) ;; *) echo "FATAL venv is not python 3.11"; exit 1;; esac
+              # ── preflight: syntax of every file this run touches ──
+              "$DZ_PYTHON" -m py_compile \
+                groot/vla/experiment/experiment.py groot/vla/experiment/base.py groot/vla/experiment/utils.py \
+                groot/vla/data/dataset/lerobot.py groot/vla/data/dataset/lerobot_sharded.py \
+                groot/vla/data/schema/embodiment_tags.py groot/vla/data/transform/state_action.py \
+                groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py \
+                groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py \
+                groot/vla/model/dreamzero/modules/wan_video_vae.py \
+                groot/vla/model/dreamzero/modules/wan_video_text_encoder.py \
+                groot/vla/model/dreamzero/modules/wan_video_image_encoder.py \
+                groot/vla/model/dreamzero/transform/dreamzero_cotrain.py \
+                run_scripts/train/dz_openarm_preflight_compose_check.py \
+                || { echo "FATAL Python syntax"; exit 1; }
+              "$DZ_PYTHON" -c "import torch, transformers, deepspeed, peft, wandb; import groot.vla.experiment.experiment; print('imports OK', torch.__version__, transformers.__version__, deepspeed.__version__)" \
+                || { echo "FATAL dreamzero env incomplete"; exit 1; }
+              "$DZ_PYTHON" -c "from decord import VideoReader; print('decord OK')" || { echo "FATAL decord (video_backend=decord)"; exit 1; }
+              # ══ paths ══════════════════════════════════════════════════════════════════════════════════════
+              export OPENARM_DATA_ROOT=/data/huiwon/data/openarm_wam_v1
+              export WAN22_CKPT_DIR=/data/huiwon/checkpoints/Wan2.2-TI2V-5B
+              export IMAGE_ENCODER_DIR=/data/huiwon/checkpoints/Wan2.1-I2V-14B-480P
+              export TOKENIZER_DIR=/data/huiwon/checkpoints/umt5-xxl
+              : "${MODEL_OUTPUT_DIR:?spec.env MODEL_OUTPUT_DIR literal required (MLXP enforcement)}"
+              export OUTPUT_DIR="$MODEL_OUTPUT_DIR/dz_openarm_wam_v1_robothuman_b32_ar4_50k"
+              mkdir -p "$OUTPUT_DIR"
+              test -d "$OPENARM_DATA_ROOT/robot" || { echo "FATAL missing dataset $OPENARM_DATA_ROOT"; exit 1; }
+              # ══ runtime env ════════════════════════════════════════════════════════════════════════════════
+              export HF_HOME=/data/huiwon/.cache/huggingface HF_HUB_OFFLINE=0 HF_HUB_DISABLE_XET=1
+              export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+              export MALLOC_ARENA_MAX=2        # glibc arena cap for the decord dataloader workers (MLXP OOM guard)
+              export NO_ALBUMENTATIONS_UPDATE=1 TOKENIZERS_PARALLELISM=false
+              export TORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_CACHE_DIR=/data/huiwon/.cache/torchinductor_dz
+              mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
+              # ══ plate (launcher re-gates PLATE_PD*NUM_GPUS*PLATE_GA == EXPECT_GLOBAL_BATCH) ══════════════════
+              export NUM_GPUS=4 MAX_CHUNK_SIZE=4 MAX_STEPS=50000 SAVE_STEPS=1000 SAVE_TOTAL_LIMIT=5 NW=4
+              export EXPECT_GLOBAL_BATCH=64 DEEPSPEED_CFG=zero2_offload
+              echo "[$TAG] plate: DZ_VARIANT=$DZ_VARIANT PLATE_PD=$PLATE_PD PLATE_GA=$PLATE_GA expect global $EXPECT_GLOBAL_BATCH"
+              # ══ wandb ══════════════════════════════════════════════════════════════════════════════════════
+              export WANDB_API_KEY=REPLACE_WITH_WANDB_KEY
+              export WANDB_ENTITY=huiwoen0516 WANDB_MODE=online WANDB_PROJECT=dreamzero
+              _LAST=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
+              echo "[$TAG] resume: latest checkpoint = ${_LAST:-none (fresh, step 0)} in $OUTPUT_DIR"
+              [ -f "$OUTPUT_DIR/config.json" ] && echo "[$TAG] WARNING config.json present -> base.py treats the run as FINISHED and exits 0"
+              echo "[$TAG] launching: DreamZero OpenArm $DZ_VARIANT, Wan2.2-TI2V-5B full FT, chunk 4, b$EXPECT_GLOBAL_BATCH (pd$PLATE_PD x 4gpu x GA$PLATE_GA), $MAX_STEPS steps, save/$SAVE_STEPS keep $SAVE_TOTAL_LIMIT -> $OUTPUT_DIR"
+              bash "$SCRIPT"
+              RC=$?; echo "[$TAG] rc=$RC $(date -u +%FT%TZ)"; exit $RC
+          volumeMounts:
+            - name: ddn
+              mountPath: /data
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "56"
+              memory: "880Gi"
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "56"
+              memory: "880Gi"
+              nvidia.com/gpu: "4"

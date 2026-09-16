@@ -89,6 +89,20 @@ class HuggingfaceTokenizer:
         return text
 
 
+def _openarm_prompt(text: str, human: bool) -> str:
+    """★ huiwon 2026-09-16 (OpenArm): prompt prefix in the same style as the DROID/AGIBOT/YAM branches below.
+    Canvas = the two ego views stacked vertically (left on top, right below, DreamTransform._prepare_video);
+    a missing view arrives as black frames from the loader (black_missing_video_keys)."""
+    who = "a human" if human else "a robot"
+    return (
+        f"A multi-view video shows that {who} "
+        + text.lower()
+        + " The video is split into two views stacked vertically: the top view shows the left ego camera and the bottom view shows the right ego camera. A black view means that camera is missing. "
+        + ("The human " if human else "The robot ")
+        + text.lower()
+    )
+
+
 def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodiment_tag_mapping=None) -> dict:
     batch = {}
     keys = features[0].keys()
@@ -124,9 +138,13 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OPENARM.value]:
+                        processed_item = _openarm_prompt(processed_item, human=False)  # ★ huiwon 2026-09-16
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OPENARM_HUMAN.value]:
+                        processed_item = _openarm_prompt(processed_item, human=True)  # ★ huiwon 2026-09-16
                     else:
-                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.") 
-                    output_values.append(processed_item)  
+                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")
+                    output_values.append(processed_item)
                 except (ValueError, SyntaxError, TypeError):
                     # If parsing fails or item is already a string, use it directly
                     if num_views > 1 and elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.AGIBOT.value]:
@@ -146,8 +164,12 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OPENARM.value]:
+                        item = _openarm_prompt(str(item), human=False)  # ★ huiwon 2026-09-16
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.OPENARM_HUMAN.value]:
+                        item = _openarm_prompt(str(item), human=True)  # ★ huiwon 2026-09-16
                     else:
-                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
+                        raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")
                     output_values.append(item)
             # print("output_values", output_values)
             ids, mask = tokenizer(output_values, return_mask=True, add_special_tokens=True)
@@ -329,6 +351,16 @@ class DreamTransform(InvertibleModalityTransform):
             #
             # Training-time augmentation:
             # - Randomly drop (black out) either left_ext or right_ext.
+            # ★ huiwon 2026-09-16 (OpenArm): 2 ego views -> vertical concat [left ; right] = (1, t, c, 2h, w),
+            #   the WAM canvas convention (left on top, right below; a missing view is black from the loader).
+            #   With 144x192 per view the canvas is 288x192 = latent 18x12 = 54 tokens/frame (frame_seqlen).
+            if self.embodiment_tag in (EmbodimentTag.OPENARM, EmbodimentTag.OPENARM_HUMAN):
+                assert v == 2, f"openarm expects exactly 2 views (left, right), got {v}"
+                concat_images = np.zeros((1, t, c, 2 * h, w), dtype=images.dtype)
+                concat_images[0, :, :, :h, :] = images[0]  # camera_ego_left  (top)
+                concat_images[0, :, :, h:, :] = images[1]  # camera_ego_right (bottom)
+                return concat_images
+
             if self.embodiment_tag == EmbodimentTag.OXE_DROID and v >= 3:
                 left_exterior = images[0]   # (t, c, h, w)
                 right_exterior = images[1]  # (t, c, h, w)
@@ -534,6 +566,18 @@ class DreamTransform(InvertibleModalityTransform):
             # default for lapa instance
             transformed_data["lapa_action"] = np.zeros_like(transformed_data["action"])
             transformed_data["lapa_action_mask"] = np.zeros_like(transformed_data["action_mask"])
+
+            # ★ huiwon 2026-09-16 (OpenArm human = VIDEO-ONLY): the human_as_openarm28 parquets carry zero
+            #   state/action placeholders. has_real_action=0 zeroes this sample's action loss
+            #   (wan_flow_matching_action_tf.py:800, per-sample broadcast); action/state (+masks) are zeroed
+            #   too so the normalized placeholders never reach the model as "real" values. The video
+            #   (dynamics) loss is unaffected — it is computed for every sample.
+            if self.embodiment_tag == EmbodimentTag.OPENARM_HUMAN:
+                transformed_data["has_real_action"] = np.zeros((), dtype=bool)
+                transformed_data["action"] = np.zeros_like(transformed_data["action"])
+                transformed_data["action_mask"] = np.zeros_like(transformed_data["action_mask"])
+                transformed_data["state"] = np.zeros_like(transformed_data["state"])
+                transformed_data["state_mask"] = np.zeros_like(transformed_data["state_mask"])
         # else:
         transformed_data["text_negative"] = "Vibrant colors, overexposed, static, blurry details, text, subtitles, style, artwork, painting, image, still, grayscale, dull, worst quality, low quality, JPEG artifacts, ugly, mutilated, extra fingers, bad hands, bad face, deformed, disfigured, mutated limbs, fused fingers, stagnant image, cluttered background, three legs, many people in the background, walking backwards."
 

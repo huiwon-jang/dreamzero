@@ -1,0 +1,18 @@
+# @package _global_
+# huiwon 2026-09-16: Wan2.2-TI2V-5B action head for the OpenArm canvas (two 144x192 ego views stacked vertically
+# = 288x192 HxW). WanVideoVAE38 16x -> latent 18x12 (even, no crop in the dynamics loss); patch (1,2,2) ->
+# 9x6 = 54 tokens per latent frame. Everything else is wan_flow_matching_action_tf_wan22 (ti2v, dim 3072,
+# 30 layers, in/out 48ch, WanVideoVAE38). Select with:
+#   model/dreamzero/action_head=wan_flow_matching_action_tf_wan22_openarm
+# Must be paired with data=dreamzero/openarm_wan22 (per-view 144x192) or openarm_human_wan22.
+
+defaults:
+  - wan_flow_matching_action_tf_wan22
+
+frame_seqlen: 54
+
+action_head_cfg:
+  config:
+    # the dataloader already emits the 288x192 canvas, so this resize is a no-op guard
+    target_video_height: 288
+    target_video_width: 192

@@ -22,6 +22,7 @@ from groot.vla.data.schema import (
     DatasetMetadata,
     DatasetStatisticalValues,
     EmbodimentTag,
+    LeRobotModalityField,
     LeRobotModalityMetadata,
     LeRobotStateActionMetadata,
 )
@@ -135,6 +136,7 @@ class LeRobotSingleDataset(Dataset):
         relative_action: bool = False,
         relative_action_keys: list[str] | None = None,
         relative_action_per_horizon: bool = False,
+        black_missing_video_keys: bool = False,
     ):
         """
         Initialize the dataset.
@@ -188,6 +190,31 @@ class LeRobotSingleDataset(Dataset):
             self.use_global_metadata = True
         self._lerobot_modality_meta = self._get_lerobot_modality_meta()
         self._lerobot_info_meta = self._get_lerobot_info_meta()
+        # ★ huiwon 2026-09-16 (OpenArm): a dataset may lack one of the camera views the modality config asks
+        #   for (the human right-only subsets have no camera_ego_left). WAM convention: a missing view is a
+        #   BLACK frame. Register the missing key against a present view's original_key so that
+        #   _get_metadata (resolution), _check_integrity and get_video_path all resolve, and remember it in
+        #   self.black_video_keys; the sharded loader substitutes zeros for these keys
+        #   (lerobot_sharded.py get_all_video_paths -> None path, get_shard -> np.zeros_like(ref view)).
+        #   Off by default (black_missing_video_keys=False) => upstream behaviour is unchanged.
+        self.black_missing_video_keys = black_missing_video_keys
+        self.black_video_keys: set[str] = set()
+        if black_missing_video_keys and "video" in self.modality_configs:
+            _present = list(self._lerobot_modality_meta.video.keys())
+            assert _present, f"{self._dataset_path}: modality.json has no video keys at all"
+            _ref_key = _present[0]
+            for _key in self.modality_configs["video"].modality_keys:
+                _subkey = _key.replace("video.", "")
+                if _subkey not in self._lerobot_modality_meta.video:
+                    _ref_original = self._lerobot_modality_meta.video[_ref_key].original_key
+                    self._lerobot_modality_meta.video[_subkey] = LeRobotModalityField(original_key=_ref_original)
+                    self.black_video_keys.add(_key)
+            if self.black_video_keys:
+                print(
+                    f"[black-view] {self._dataset_path.name}: {sorted(self.black_video_keys)} absent in modality.json "
+                    f"-> black frames (shape of '{_ref_key}')",
+                    flush=True,
+                )
         # Notice: We also include discarded trajectories in stats for larger state coverage, for questions please ask @Fengyuan Hu @Yuqi Xie
         self._lerobot_stats_meta = self._get_lerobot_stats_meta()
         
@@ -981,13 +1008,16 @@ class LeRobotSingleDataset(Dataset):
                 for line in f:
                     episode_step_filter = json.loads(line)
                     trajectory_id = episode_step_filter["episode_index"]
-                    all_indices = np.arange(self.trajectory_lengths[trajectory_id].item())
+                    # ★ huiwon 2026-09-16: episode ids need not be 0..N-1 (openarm rlwrld_human_lerobot dropped
+                    #   7 episodes) -> look the length up by POSITION, like every other accessor does.
+                    all_indices = np.arange(self.trajectory_lengths[self.get_trajectory_index(trajectory_id)].item())
                     indices_to_filter = np.array(episode_step_filter["step_indices"])
                     step_filter[trajectory_id] = np.setdiff1d(all_indices, indices_to_filter)
         else:
             for trajectory_id in self.trajectory_ids:
                 step_filter[trajectory_id] = np.arange(
-                    self.trajectory_lengths[trajectory_id].item()
+                    # ★ huiwon 2026-09-16: by position, not by id (non-contiguous episode_index, see above)
+                    self.trajectory_lengths[self.get_trajectory_index(trajectory_id)].item()
                 )
         return step_filter
 
@@ -1042,8 +1072,26 @@ class LeRobotSingleDataset(Dataset):
                 fps = le_video_meta["video_info"]["video.fps"]
             except (ValueError, KeyError):
                 # channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
-                channels = le_video_meta["info"]["video.channels"]
-                fps = le_video_meta["info"]["video.fps"]
+                try:
+                    channels = le_video_meta["info"]["video.channels"]
+                    fps = le_video_meta["info"]["video.fps"]
+                except KeyError:
+                    # ★ huiwon 2026-09-16: third layout (openarm human_as_openarm28/* info.json):
+                    #   names=[height,width,channel], video_info={"fps":..} (no "video.fps"),
+                    #   info={"video.fps":..} (no "video.channels") -> neither branch above fits.
+                    _names = list(le_video_meta.get("names") or [])
+                    if "channel" in _names:
+                        channels = le_video_meta["shape"][_names.index("channel")]
+                    elif "channels" in _names:
+                        channels = le_video_meta["shape"][_names.index("channels")]
+                    else:
+                        channels = le_video_meta["shape"][-1]
+                    fps = (
+                        le_video_meta.get("info", {}).get("video.fps")
+                        or le_video_meta.get("video_info", {}).get("video.fps")
+                        or le_video_meta.get("video_info", {}).get("fps")
+                    )
+                    assert fps is not None, f"{self._dataset_path}: cannot determine fps of video feature {original_key}"
             simplified_modality_meta["video"][new_key] = {
                 "resolution": [width, height],
                 "channels": channels,
@@ -2457,6 +2505,25 @@ class LeRobotMixtureDataset(Dataset):
                 modality_configs[modality].add(json.dumps(configs))
         merged_metadata["modalities"] = {}
         for modality, configs in modality_configs.items():
+            if modality == "video" and len(configs) > 1:
+                # ★ huiwon 2026-09-16: OpenArm subsets of ONE embodiment tag legitimately differ here — fps 20 vs
+                #   30, and banana_v21_openarm28 carries alias keys (ego_left/ego_right) next to camera_ego_*.
+                #   Transforms only consume `resolution` from this block (VideoToTensor.check_input), so merge
+                #   key-wise: resolution/channels must agree per key, fps keeps the first value (informational).
+                merged_video: dict = {}
+                for cfg_json in sorted(configs):
+                    for k, v in json.loads(cfg_json).items():
+                        if k in merged_video:
+                            assert (
+                                merged_video[k]["resolution"] == v["resolution"]
+                                and merged_video[k]["channels"] == v["channels"]
+                            ), f"video key {k} differs in resolution/channels across datasets: {merged_video[k]} vs {v}"
+                        else:
+                            merged_video[k] = v
+                print(f"[merge_metadata] {merged_metadata['embodiment_tag']}: video configs differ across datasets "
+                      f"(fps/alias keys only); merged key-wise -> {sorted(merged_video)}", flush=True)
+                merged_metadata["modalities"][modality] = merged_video
+                continue
             # Check that all modality configs correspond to the same tag matches
             assert (
                 len(configs) == 1

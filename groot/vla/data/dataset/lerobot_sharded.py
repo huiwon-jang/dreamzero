@@ -64,6 +64,10 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
             video_paths[trajectory_id] = {}
             for key in self.modality_keys["video"]:
                 assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
+                if key in getattr(self, "black_video_keys", ()):
+                    # ★ huiwon 2026-09-16: view absent from this dataset -> black frames (see get_shard)
+                    video_paths[trajectory_id][key] = None
+                    continue
                 video_paths[trajectory_id][key] = self.get_video_path(
                     trajectory_id, key.replace("video.", "")
                 )
@@ -378,6 +382,10 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             video_paths[trajectory_id] = {}
             for key in self.modality_keys["video"]:
                 assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
+                if key in getattr(self, "black_video_keys", ()):
+                    # ★ huiwon 2026-09-16: view absent from this dataset -> black frames (see get_shard)
+                    video_paths[trajectory_id][key] = None
+                    continue
                 video_paths[trajectory_id][key] = self.get_video_path(
                     trajectory_id, key.replace("video.", "")
                 )
@@ -477,18 +485,30 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             assert isinstance(
                 trajectory_id, int
             ), f"trajectory_id must be an integer, got {type(trajectory_id)}"
+            _black_keys: list[str] = []
+            _ref_frames = None
             for key in modality_keys["video"]:
                 assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
                 if key not in cached_frames:
                     cached_frames[key] = []
+                _video_path = video_paths[trajectory_id][key]
+                if _video_path is None:
+                    # ★ huiwon 2026-09-16: missing view (black_missing_video_keys) -> zeros, filled below
+                    _black_keys.append(key)
+                    continue
                 frames = get_frames_by_timestamps(
-                    video_paths[trajectory_id][key].as_posix(),
+                    _video_path.as_posix(),
                     timestamps=parquet_timestamps,
                     video_backend=video_backend,
                     video_backend_kwargs=video_backend_kwargs,
                     fps=fps,
                 )
                 cached_frames[key].append(frames)
+                if _ref_frames is None:
+                    _ref_frames = frames
+            for key in _black_keys:
+                assert _ref_frames is not None, f"trajectory {trajectory_id}: every video key is missing"
+                cached_frames[key].append(np.zeros_like(_ref_frames))  # black frame, same (T,H,W,3) uint8
             if cached_df is None:
                 cached_df = parquet_df
             else:
@@ -847,6 +867,9 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         
         # print("sampled indices for state", sampled_indices)
 
+        # ★ huiwon 2026-09-16: if get_video fell back to the clipped forward window, use the SAME anchors
+        sampled_indices = self._apply_fallback_anchors(step_indices, trajectory_length, sampled_indices, per_step=1)
+
         # Pad the data using the computed sampled indices
         return self.retrieve_data_and_pad(
             array=data_array,
@@ -1025,6 +1048,9 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         
         # print("sampled indices for action", first_idx, sampled_indices, trajectory_length)
 
+        # ★ huiwon 2026-09-16: if get_video fell back to the clipped forward window, use the SAME anchors
+        sampled_indices = self._apply_fallback_anchors(step_indices, trajectory_length, sampled_indices, per_step=24)
+
         # Pad the data using the computed sampled indices
         action_data = self.retrieve_data_and_pad(
             array=data_array,
@@ -1128,6 +1154,48 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         
         return relative_action_data
     
+    def _lang_range_fallback(self, step_indices, first_idx: int, trajectory_length: int) -> np.ndarray:
+        """huiwon 2026-09-14/15: when the language-consistent sampler cannot build a full 8n+1 window
+        (short episode / anchor near the end) upstream returned ``np.array([])`` (float64), which the
+        caller indexes -> IndexError in every DataLoader worker. Returning the caller's raw
+        ``step_indices`` is NOT a valid substitute either: it is the un-subsampled 25-frame request,
+        while every other sample is 8n+1 frames at stride 3 -> collate "all input arrays must have the
+        same shape". So build exactly what the sampler would have built if the window fit:
+        anchor + 3*k for k in range(8*max_chunk_size+1), clipped to the last frame (frames past the
+        end repeat the final frame), and register the matching chunk count for get_state/get_action."""
+        n = 8 * int(self.max_chunk_size) + 1
+        idx = int(first_idx) + 3 * np.arange(n, dtype=int)
+        idx = np.minimum(idx, int(trajectory_length) - 1).astype(int)
+        if not hasattr(self, "_current_num_chunks"):
+            self._current_num_chunks = {}
+        self._current_num_chunks[int(first_idx)] = int(self.max_chunk_size)
+        # ★ huiwon 2026-09-16: publish the chunk anchors of this window so get_state/get_action build the
+        #   SAME forward window (anchor + 24k, clipped) instead of their own language-anchored expansion,
+        #   which can pick different (earlier) chunks and silently misalign state/action with the video.
+        if not hasattr(self, "_fallback_anchors"):
+            self._fallback_anchors = {}
+        self._fallback_anchors[int(first_idx)] = [int(first_idx) + 24 * k for k in range(int(self.max_chunk_size))]
+        if not getattr(self, "_lang_range_fallback_logged", False):
+            self._lang_range_fallback_logged = True
+            print(f"[lang-range] fallback window anchor={int(first_idx)} n={n} stride=3 (clipped to len {trajectory_length}); logged once", flush=True)
+        return idx
+
+    def _apply_fallback_anchors(self, step_indices, trajectory_length, sampled_indices, per_step: int) -> np.ndarray:
+        """huiwon 2026-09-16: state/action counterpart of ``_lang_range_fallback``. If get_video registered a
+        fallback window for this sample's anchor (``self._fallback_anchors[first_idx]``), return the matching
+        indices: the chunk anchors (per_step=1, state) or anchor+0..23 per chunk (per_step=24, action),
+        clipped to the last frame exactly like the video window. Otherwise return ``sampled_indices`` untouched.
+        get_video always runs before get_state/get_action for a sample (modality order video/state/action),
+        and the normal sampler path pops the entry, so a stale key cannot leak into another trajectory."""
+        if len(step_indices) == 0:
+            return sampled_indices
+        first_idx = max(0, min(int(step_indices[0]), int(trajectory_length) - 1))
+        anchors = getattr(self, "_fallback_anchors", {}).get(first_idx)
+        if anchors is None:
+            return sampled_indices
+        idx = np.concatenate([int(a) + np.arange(per_step, dtype=int) for a in anchors]).astype(int)
+        return np.minimum(idx, int(trajectory_length) - 1)
+
     def _uniform_sample_from_language_ranges(
         self, 
         step_indices: np.ndarray, 
@@ -1204,7 +1272,15 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         
         # De-duplicate and sort ascending for stable ordering
         if len(sampled_list) == 0:
-            return np.array([])
+            # ★ huiwon 2026-09-13: add_step_set() refuses any anchor with
+            #   `anchor + 23 >= trajectory_length`, so an episode (or an anchor late in one)
+            #   shorter than a 24-frame window yields NOTHING here. The original
+            #   `np.array([])` is float64, and the caller indexes `cached_shard[key][...]`
+            #   with it -> "IndexError: arrays used as indices must be of integer (or boolean)
+            #   type", killing every rank in the first steps. Fall back to the caller's own
+            #   (clipped) step_indices: the language-consistency preference is dropped for this
+            #   sample, but the window stays the requested one and the dtype stays integer.
+            return self._lang_range_fallback(step_indices, first_idx, trajectory_length)
         unique_sorted = np.array(sorted(set(sampled_list)), dtype=int)
         # Ensure we return at most 81 frames
         if unique_sorted.size > max_frames:
@@ -1223,12 +1299,23 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                 # Trim to 8n+1 format. Require at least 9 frames so (noisy_frames-1)//num_frame_per_block >= 1
                 # for action/state model invariant (CausalWanModel); otherwise return empty so sample is skipped.
                 if unique_sorted.size <= 8:
-                    return np.array([])
+                    # ★ huiwon 2026-09-14: second float64-empty return (anchor too close to the end
+                    #   for the +3 tail frame). Same IndexError at get_video(); same fallback.
+                    return self._lang_range_fallback(step_indices, first_idx, trajectory_length)
                 unique_sorted = unique_sorted[:-7]
         
         # ensure that unique_sorted has 4n+1 frames
         assert unique_sorted.size % 8 == 1, f"unique_sorted size {unique_sorted.size} is not 4n+1"
-        
+
+        # ★ huiwon 2026-09-16: a TRIMMED window (8n+1 with n < max_chunk_size: the +3 tail frame did not fit,
+        #   i.e. the last chunk anchor is exactly len-24) is legal upstream because upstream trains with
+        #   per_device_train_batch_size=1. At pd>1 the collate np.stack needs identical shapes, so every
+        #   sample must carry exactly 8*max_chunk_size+1 frames -> take the deterministic clipped window.
+        if unique_sorted.size != max_frames:
+            return self._lang_range_fallback(step_indices, first_idx, trajectory_length)
+        if hasattr(self, "_fallback_anchors"):
+            self._fallback_anchors.pop(int(first_idx), None)  # normal path: no fallback for this anchor
+
         # Store the number of chunks for alignment with action/state
         num_video_chunks = (unique_sorted.size - 1) // 8
         if not hasattr(self, '_current_num_chunks'):

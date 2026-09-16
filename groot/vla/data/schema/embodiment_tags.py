@@ -346,3 +346,17 @@ class EmbodimentTag(Enum):
     """
     The Mecka robot with hands.
     """
+
+    # ------------- huiwon 2026-09-16: OpenArm (rlwrld) -------------
+    OPENARM = "openarm"
+    """
+    OpenArm robot: 28-dim state/action = neck 2 | left_arm 7 | right_arm 7 | left_hand 6 | right_hand 6,
+    two ego cameras (camera_ego_left / camera_ego_right, 192x256), stacked vertically by DreamTransform.
+    """
+
+    OPENARM_HUMAN = "openarm_human"
+    """
+    Human demonstrations re-packed in the OpenArm LeRobot layout (human_as_openarm28/*): VIDEO-ONLY.
+    State/action columns are zero placeholders; DreamTransform sets has_real_action=False so the action
+    loss is masked (wan_flow_matching_action_tf.py:800) and only the video (dynamics) loss trains.
+    """

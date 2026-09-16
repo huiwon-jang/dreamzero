@@ -40,3 +40,8 @@ embodiment_tag_to_projector_index:
   sim_behavior_r1_pro: 31
   mecka_hands: 27
   real_r1_pro_sharpa: 28
+  # huiwon 2026-09-16 (OpenArm). Only used to pick the prompt prefix in dreamzero_cotrain.collate and as the
+  # embodiment_id tensor; CausalWanModel forces embodiment_id=0 for its category-specific encoders
+  # (wan_video_dit_action_casual_chunk.py:1365,1755), so the index value itself is not load-bearing.
+  openarm: 33
+  openarm_human: 34

@@ -1,0 +1,41 @@
+# @package _global_
+# huiwon 2026-09-16: OpenArm ROBOT + HUMAN co-training mixture for DreamZero on Wan2.2-TI2V-5B.
+# Everything (geometry, normalization, transforms) comes from openarm_wan22.yaml; only the mixture differs.
+#
+# Mixing: two mixture elements, each dataset_weight 1.0 with distribute_weights=true, and
+# balance_dataset_weights=false => robot subsets share 1.0 frame-proportionally, human subsets share 1.0
+# frame-proportionally, and after normalization robot : human = 0.5 : 0.5 IN EXPECTATION. DreamZero has no
+# per-batch ratio: ShardedLeRobotMixtureDataset draws whole SHARDS (~1e4 frames of ONE subset) with
+# probability weight_i * shard_len/dataset_len and yields 1000 samples per visited shard, so a single
+# per-device micro-batch is homogeneous (all robot or all human) and the 1:1 holds over many steps, not per
+# optimizer step. (The WAM MIX_EXACT "32 robot + 32 human per step" is not reproducible here.)
+#
+# Human subsets: embodiment tag openarm_human -> DreamTransform sets has_real_action=False and zeroes
+# state/action (video-only). The three openarm_validation_v2_junhyeong subsets and rlwrld_human_lerobot have
+# ONLY camera_ego_right -> camera_ego_left is a black frame (black_missing_video_keys); anyh2r has both views.
+
+defaults:
+  - /data/dreamzero/openarm_wan22   # absolute group path (hydra nested-defaults resolution)
+  - _self_
+
+train_dataset:
+  mixture_spec:
+    - dataset_path:
+        openarm:
+          - ${openarm_data_root}/robot/openarm_ego_jungwook
+          - ${openarm_data_root}/robot/openarm_teleop_v3/bottle
+          - ${openarm_data_root}/robot/openarm_teleop_v3/cup
+          - ${openarm_data_root}/robot/openarm_teleop_v3/doll
+          - ${openarm_data_root}/robot/openarm_teleop_v3/snack
+          - ${openarm_data_root}/robot/banana_v21_openarm28
+      dataset_weight: 1.0
+      distribute_weights: true
+    - dataset_path:
+        openarm_human:
+          - ${openarm_data_root}/human_as_openarm28/rlwrld_human_lerobot
+          - ${openarm_data_root}/human_as_openarm28/openarm_validation_v2_junhyeong/close_air_fryer
+          - ${openarm_data_root}/human_as_openarm28/openarm_validation_v2_junhyeong/left_hand_box_white_container
+          - ${openarm_data_root}/human_as_openarm28/openarm_validation_v2_junhyeong/open_air_fryer
+          - ${openarm_data_root}/human_as_openarm28/anyh2r
+      dataset_weight: 1.0
+      distribute_weights: true
