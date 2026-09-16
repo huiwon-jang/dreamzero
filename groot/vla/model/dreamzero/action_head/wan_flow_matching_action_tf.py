@@ -792,7 +792,13 @@ class WANPolicyHead(ActionHead):
                 action_loss_per_sample = torch.nn.functional.mse_loss(
                     action_noise_pred.float(), training_target_action.float(), reduction='none'
                 ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
+                # ★ huiwon 2026-09-13: has_real_action is a per-sample scalar (transform writes np.zeros(())),
+                #   so the batch collates it to (B,). `[:, None]` gives (B,1), which broadcasts against the
+                #   (B, T_action, D) loss as (1,B,1) -> dim1 B vs T mismatch whenever B != T_action
+                #   (RuntimeError: size of tensor a (B) must match tensor b (T) at non-singleton dimension 1).
+                #   Reshape to (B,1,1) so the flag scales whole samples, which is the stated intent.
+                _hra = has_real_action.reshape(-1, *([1] * (action_loss_per_sample.dim() - 1))).float()
+                action_loss_per_sample = _hra * action_loss_per_sample  # apply has_real_action
                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)

@@ -1,0 +1,224 @@
+# ==============================================================================================
+# DreamZero DROID — Wan2.2-TI2V-5B FULL fine-tune — MLXP single node, 4x H200, eff. batch 32 (= our DROID b128 in content: DreamZero 1 sample = 4 chained chunks), 200K steps
+# ----------------------------------------------------------------------------------------------
+#   repo     : /data/huiwon/dreamzero  (own full clone of https://github.com/dreamzero0/dreamzero,
+#              HEAD ab790c19 "Update architecture differences in WAN22_BACKBONE.md"; own .venv, python 3.11)
+#   launcher : run_scripts/train/dz_droid_wan22_full_b32_200k.sh — a verbatim derivative of upstream
+#              scripts/train/droid_training_full_finetune_wan22.sh; only the batch/save_steps values,
+#              the python selection and the auto-download->hard-gate swap differ (documented in its header).
+#   recipe   : num_frames=33 action_horizon=24 num_views=3 · action head wan_flow_matching_action_tf_wan22
+#              (CausalWanModel ti2v, dim 3072, 30 layers, in/out 48ch, WanVideoVAE38) · transform
+#              dreamzero_cotrain · num_frame_per_block=2 num_action_per_block=24 num_state_per_block=1 ·
+#              seed 42 · lr 1e-5 · warmup_ratio 0.05 · wd 1e-5 · cosine · bf16+tf32 · 320x160 (latent 20x10,
+#              frame_seqlen 50) · max_chunk_size=4 · train_architecture=full · save_lora_only=false ·
+#              upload_checkpoints=false · deepspeed zero2_offload (CPU optimizer offload = what makes a
+#              5B full fine-tune fit on 4 GPUs).
+#   batch    : 4 GPU x per_device 2 x GA 4 = 32 (experiment/utils.py:104 compute_grad_accum_to_match_global_bs
+#              => global_batch_size // (per_device * world_size) = 32 // 8 = 4).
+#              ★ GA=8 on ZeRO-2 is ONLY correct with deepspeed >= 0.19.6 (0.17.x drops every micro-batch but
+#              the last, microsoft/DeepSpeed#7718; 0.18.3-0.19.5 carry the #8224 regression). uv.lock pins
+#              0.19.6 and the launcher re-asserts it at runtime.
+#   save     : save_steps=5000 / save_total_limit=10. A 5B full fine-tune checkpoint carries ZeRO-2 optimizer
+#              state (~100 GB) => ~1 TB resident (66 TB free on /data). Upstream's 1000 would be 200 writes.
+#   data     : /data/shared_dataset/DreamZero-DROID-Data (LeRobot; data/ meta/ videos/). NO writable overlay
+#              needed: both files the loader would otherwise COMPUTE-AND-WRITE into the dataset root already
+#              exist (meta/stats.json lerobot.py:420-457, meta/relative_stats_dreamzero.json lerobot.py:459-531).
+#   weights  : Wan2.2-TI2V-5B (DiT 3 shards + models_t5_umt5-xxl-enc-bf16.pth + Wan2.2_VAE.pth) at
+#              /data/huiwon/checkpoints/Wan2.2-TI2V-5B; CLIP models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+#              at /data/huiwon/checkpoints/Wan2.1-I2V-14B-480P (Wan2.2 ships no CLIP, but the code needs it:
+#              wan_flow_matching_action_tf.py:247-252 loads it unconditionally and :665 feeds clip_feature into
+#              the DiT, whose ti2v branch builds img_emb — wan_video_dit_action_casual_chunk.py:1419-1421,:2093);
+#              umt5-xxl TOKENIZER ONLY at /data/huiwon/checkpoints/umt5-xxl (AutoTokenizer, no weights —
+#              dreamzero_cotrain.py:52; the T5 *encoder* weights come from the .pth above).
+#   resume   : implicit. experiment/base.py:644 get_checkpoint_path(OUTPUT_DIR) -> highest checkpoint-N and
+#              resume_from_checkpoint=True. No flag to pass. (A config.json in OUTPUT_DIR means "finished"
+#              and the process exit(0)s — utils.py:57.)
+#   ckpt     : $MODEL_OUTPUT_DIR/dreamzero_droid_wan22_full_b32_200k/checkpoint-N
+#   logs     : /data/huiwon/logs/gr00t-vdm/dz-droid-wan22-full-b32-200k-4gpu-<ts>.{out,err}
+#   NOT GPU-tested (written 2026-09-12; server dry-run + bash -n + pod-side uv lock/sync only).
+#   Smoke witnesses to grep on the first run:
+#     "[batch] global=32 = 4 gpu x pd2 x GA4", "[deepspeed] 0.19.6 — ZeRO-2 with GA=8 is safe",
+#     "Set global batch size to 32, set gradient accumulation steps to 4" (base.py:767),
+#     "Loading relative action stats from .../meta/relative_stats_dreamzero.json" (lerobot.py:485),
+#     "[dit] shards OK:", "[resume] latest checkpoint in OUTPUT_DIR: none (fresh run from step 0)",
+#     "FAILURES: 0" from run_scripts/train/dz_preflight_compose_check.py.
+# ==============================================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: huiwon-dz-droid-wan22-full-b32-200k-4gpu
+  namespace: p-rlwrld
+  labels:
+    mlxp/job-class: normal
+    project-code: sub_wam
+    project-short-name: sub_wam
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      annotations:
+        # BOTH zone markers are load-bearing: without the zone annotation the MLXP pod-admission
+        # webhook falls back to zone "test" and denies every pod (FailedCreate loop).
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+        sidecar.istio.io/inject: "false"
+      labels:
+        mlxp/job-class: normal
+        project-code: sub_wam
+        project-short-name: sub_wam
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        mlx.navercorp.com/hardware-type: gpu
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+      # No kubernetes.io/hostname affinity on purpose (MLXP resource convention 2026-09-06).
+      imagePullSecrets:
+        - name: mlxp-registry
+      volumes:
+        - name: ddn
+          persistentVolumeClaim:
+            claimName: ddn-rlwrld-shared
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Gi
+      containers:
+        - name: train
+          image: mlxp.kr.ncr.ntruss.com/taeyoung/groot:v1
+          imagePullPolicy: IfNotPresent
+          env:
+            # MLXP enforcement: MODEL_OUTPUT_DIR MUST be a spec.env literal (a container-side export is
+            # not seen by the scheduler check -> suspend-kill).
+            - name: MODEL_OUTPUT_DIR
+              value: /data/rlwrld-unified-checkpoints/huiwon/dreamzero
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: GLOO_SOCKET_FAMILY
+              value: AF_INET
+            - name: LD_PRELOAD
+              value: /data/libipv4_force_v2.so
+            - name: NCCL_IB_HCA
+              value: "mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              TAG=dz-droid-wan22-full-b32-200k-4gpu
+              mkdir -p /data/huiwon/logs/gr00t-vdm /data/huiwon/tmp
+              L=/data/huiwon/logs/gr00t-vdm/$TAG-$(date +%Y%m%d_%H%M%S)
+              exec > >(tee -a "$L.out") 2> >(tee -a "$L.err" >&2)
+              echo "[$TAG] START $(date -u +%FT%TZ) pod=$HOSTNAME node=${NODE_NAME:-?}"
+              rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/*nvidia*.list 2>/dev/null || true
+              APT_OK=0
+              for i in 1 2 3; do apt-get update -qq && apt-get install -y ffmpeg iproute2 libibverbs-dev ibverbs-utils && { APT_OK=1; break; }; echo "apt retry $i"; sleep 15; done
+              [ "$APT_OK" = 1 ] || { echo "FATAL apt/ffmpeg"; exit 1; }
+              export UV_CACHE_DIR=/data/huiwon/.uv-cache UV_PYTHON_INSTALL_DIR=/data/huiwon/.uv-python
+              export TMPDIR=/data/huiwon/tmp
+              command -v uv >/dev/null 2>&1 || (curl -LsSf https://astral.sh/uv/install.sh | sh)
+              export PATH="$HOME/.local/bin:$PATH"
+              # ── repo: the dedicated dreamzero clone (its OWN .venv; every other /data/huiwon/* clone untouched) ──
+              export BASE_DIR=/data/huiwon/dreamzero
+              cd "$BASE_DIR" || { echo "FATAL no clone $BASE_DIR"; exit 1; }
+              echo "[$TAG] branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo nogit) HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+              test -d groot/vla || { echo "FATAL $BASE_DIR is not a dreamzero checkout"; exit 1; }
+              SCRIPT=run_scripts/train/dz_droid_wan22_full_b32_200k.sh
+              test -f "$SCRIPT" || { echo "FATAL missing launcher $SCRIPT"; exit 1; }
+              bash -n "$SCRIPT" || { echo "FATAL launcher syntax"; exit 1; }
+              # ══ env build: python 3.11 venv in the clone (uv.lock committed here pins deepspeed 0.19.6) ══
+              uv sync --python 3.11 || { echo FAIL_envsetup_sync; exit 1; }
+              uv pip install -e . --no-deps || { echo FAIL_envsetup_editable; exit 1; }
+              export DZ_PYTHON="$BASE_DIR/.venv/bin/python"
+              test -x "$DZ_PYTHON" || { echo "FATAL no venv python at $DZ_PYTHON"; exit 1; }
+              echo "[$TAG] python=$("$DZ_PYTHON" -V 2>&1)"
+              case "$("$DZ_PYTHON" -V 2>&1)" in *" 3.11."*) ;; *) echo "FATAL venv is not python 3.11"; exit 1;; esac
+              # ── preflight: syntax of every file this run touches ──
+              "$DZ_PYTHON" -m py_compile \
+                groot/vla/experiment/experiment.py groot/vla/experiment/base.py groot/vla/experiment/utils.py \
+                groot/vla/data/dataset/lerobot.py groot/vla/data/dataset/lerobot_sharded.py \
+                groot/vla/data/transform/state_action.py \
+                groot/vla/model/dreamzero/action_head/wan_flow_matching_action_tf.py \
+                groot/vla/model/dreamzero/modules/wan_video_dit_action_casual_chunk.py \
+                groot/vla/model/dreamzero/modules/wan_video_vae.py \
+                groot/vla/model/dreamzero/modules/wan_video_text_encoder.py \
+                groot/vla/model/dreamzero/modules/wan_video_image_encoder.py \
+                groot/vla/model/dreamzero/transform/dreamzero_cotrain.py \
+                || { echo "FATAL Python syntax"; exit 1; }
+              "$DZ_PYTHON" -c "import torch, transformers, deepspeed, peft, wandb; import groot.vla.experiment.experiment; print('imports OK', torch.__version__, transformers.__version__, deepspeed.__version__)" \
+                || { echo "FATAL dreamzero env incomplete"; exit 1; }
+              "$DZ_PYTHON" -c "from decord import VideoReader; print('decord OK')" || { echo "FATAL decord (video_backend=decord in droid_relative_wan22.yaml)"; exit 1; }
+              # ══ paths ══════════════════════════════════════════════════════════════════════════════════════
+              export DROID_DATA_ROOT=/data/shared_dataset/DreamZero-DROID-Data
+              export WAN22_CKPT_DIR=/data/huiwon/checkpoints/Wan2.2-TI2V-5B
+              export IMAGE_ENCODER_DIR=/data/huiwon/checkpoints/Wan2.1-I2V-14B-480P
+              export TOKENIZER_DIR=/data/huiwon/checkpoints/umt5-xxl
+              : "${MODEL_OUTPUT_DIR:?spec.env MODEL_OUTPUT_DIR literal required (MLXP enforcement)}"
+              export OUTPUT_DIR="$MODEL_OUTPUT_DIR/dreamzero_droid_wan22_full_b32_200k"
+              mkdir -p "$OUTPUT_DIR"
+              # dataset: read-only for us. BOTH stats files must pre-exist or lerobot.py would compute and
+              # WRITE them into the shared dataset root (lerobot.py:455 / :530).
+              test -d "$DROID_DATA_ROOT/meta" || { echo "FATAL missing dataset $DROID_DATA_ROOT"; exit 1; }
+              for f in meta/info.json meta/modality.json meta/stats.json meta/relative_stats_dreamzero.json; do
+                test -s "$DROID_DATA_ROOT/$f" || { echo "FATAL missing $DROID_DATA_ROOT/$f (loader would WRITE it into the shared dataset)"; exit 1; }
+              done
+              test -d "$DROID_DATA_ROOT/videos" || { echo "FATAL missing $DROID_DATA_ROOT/videos"; exit 1; }
+              # every weight file the hydra command references
+              for f in "$WAN22_CKPT_DIR/models_t5_umt5-xxl-enc-bf16.pth" \
+                       "$WAN22_CKPT_DIR/Wan2.2_VAE.pth" \
+                       "$WAN22_CKPT_DIR/diffusion_pytorch_model.safetensors.index.json" \
+                       "$IMAGE_ENCODER_DIR/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
+                       "$TOKENIZER_DIR/tokenizer.json" "$TOKENIZER_DIR/spiece.model"; do
+                test -s "$f" || { echo "FATAL missing/empty weight $f"; exit 1; }
+              done
+              # ══ runtime env ════════════════════════════════════════════════════════════════════════════════
+              export HF_HOME=/data/huiwon/.cache/huggingface HF_HUB_OFFLINE=0 HF_HUB_DISABLE_XET=1
+              export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+              export MALLOC_ARENA_MAX=2        # glibc arena cap for the decord dataloader workers (MLXP OOM guard)
+              export NO_ALBUMENTATIONS_UPDATE=1 TOKENIZERS_PARALLELISM=false
+              export TORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_CACHE_DIR=/data/huiwon/.cache/torchinductor_dz
+              mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
+              # ══ plate: 4 gpu x per_device 2 x GA 4 = 32 ═══════════════════════════════════════════════════
+              export NUM_GPUS=4 PER_DEVICE_BS=2 GLOBAL_BATCH_SIZE=32 MAX_STEPS=200000 SAVE_STEPS=5000 SAVE_TOTAL_LIMIT=10 NW=4
+              export DEEPSPEED_CFG=zero2_offload
+              test -s "groot/vla/configs/deepspeed/$DEEPSPEED_CFG.json" || { echo "FATAL missing deepspeed cfg $DEEPSPEED_CFG.json"; exit 1; }
+              _PER_STEP=$(( PER_DEVICE_BS * NUM_GPUS ))
+              [ $(( GLOBAL_BATCH_SIZE % _PER_STEP )) -eq 0 ] || { echo "FATAL global batch $GLOBAL_BATCH_SIZE not divisible by $_PER_STEP"; exit 2; }
+              _GA=$(( GLOBAL_BATCH_SIZE / _PER_STEP ))
+              [ $(( PER_DEVICE_BS * NUM_GPUS * _GA )) -eq 32 ] || { echo "FATAL effective batch != 32"; exit 2; }
+              echo "[$TAG] batch gate OK: ${NUM_GPUS} gpu x pd${PER_DEVICE_BS} x GA${_GA} = 32"
+              # ZeRO-2 + GA>1 is only correct on deepspeed >= 0.19.6 (#7718 / #8224)
+              _DSV=$("$DZ_PYTHON" -c "import importlib.metadata as m; print(m.version('deepspeed'))" 2>/dev/null)
+              case "$_DSV" in
+                0.19.6|0.19.[7-9]*|0.[2-9]*|[1-9]*) echo "[$TAG] deepspeed $_DSV — ZeRO-2 GA=$_GA allowed";;
+                *) [ "$_GA" = "1" ] || { echo "FATAL GA=$_GA needs deepspeed>=0.19.6 (have ${_DSV:-?}; ZeRO-2 GA bug #7718)"; exit 2; };;
+              esac
+              # hydra composition gate (hydra+omegaconf only, no torch/GPU): proves every override key in the
+              # launcher exists, and that the COMPOSED TrainingArguments really carry b32 / pd4 / GA8 /
+              # 200k steps / save 5000 / zero2_offload / ti2v-3072-30L DiT + WanVideoVAE38 + the 4 weight paths.
+              "$DZ_PYTHON" run_scripts/train/dz_preflight_compose_check.py || { echo "FATAL hydra compose preflight gate"; exit 2; }
+              # ══ wandb ══════════════════════════════════════════════════════════════════════════════════════
+              export WANDB_API_KEY=REPLACE_WITH_WANDB_KEY
+              export WANDB_ENTITY=huiwoen0516 WANDB_MODE=online WANDB_PROJECT=dreamzero
+              # auto-resume is implicit (experiment/base.py:644 get_checkpoint_path(OUTPUT_DIR))
+              _LAST=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sed 's/.*checkpoint-//' | sort -n | tail -1)
+              echo "[$TAG] resume: latest checkpoint = ${_LAST:-none (fresh, step 0)} in $OUTPUT_DIR"
+              [ -f "$OUTPUT_DIR/config.json" ] && echo "[$TAG] WARNING config.json present -> base.py treats the run as FINISHED and exits 0"
+              echo "[$TAG] launching: DreamZero DROID full FT Wan2.2-TI2V-5B, b32 (pd2 x 4gpu x GA4), ${MAX_STEPS} steps, save/${SAVE_STEPS}, zero2_offload -> $OUTPUT_DIR"
+              bash "$SCRIPT"
+              RC=$?; echo "[$TAG] rc=$RC $(date -u +%FT%TZ)"; exit $RC
+          volumeMounts:
+            - name: ddn
+              mountPath: /data
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "56"
+              memory: "880Gi"
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "56"
+              memory: "880Gi"
+              nvidia.com/gpu: "4"

@@ -1,3 +1,9 @@
+# ★ deepspeed FIRST (huiwon 2026-09-13): transformers 4.51.3 의 modeling_utils:158 이 deepspeed 를
+#   import 하고, deepspeed 0.19.6 의 runtime/hybrid_engine.py:26 이 다시 transformers.models.opt 를
+#   집어 순환 import 로 죽는다 (ImportError: PreTrainedModel from partially initialized
+#   transformers.modeling_utils). deepspeed 를 먼저 완전히 import 해두면 순환이 끊긴다.
+import deepspeed as _ds_preimport  # noqa: F401
+
 import logging
 import os
 import time
