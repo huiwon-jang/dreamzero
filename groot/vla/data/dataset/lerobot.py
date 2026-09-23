@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 from typing import Sequence, TypeVar
 
+import os
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -16,7 +17,7 @@ from tqdm import tqdm
 import yaml
 import torch
 
-from groot.vla.common.utils import get_all_frames, get_frames_by_timestamps
+from groot.vla.common.utils import get_all_frames, get_frames_by_indices, get_frames_by_timestamps
 from groot.vla.data.conversion.gr1.get_initial_actions import load_initial_actions
 from groot.vla.data.schema import (
     DatasetMetadata,
@@ -1517,6 +1518,18 @@ class LeRobotSingleDataset(Dataset):
         # Get the action/state timestamps for each frame in the video
         assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
         assert "timestamp" in self.curr_traj_data.columns, f"No timestamp found in {trajectory_id=}"
+        # huiwon 2026-09-23: decode by FRAME INDEX (row index == frame index for every LeRobot subset we
+        # train on; verified frames == rows). The timestamp path maps parquet timestamps onto the mp4
+        # container's own frame clock, which is wrong whenever the container fps tag differs from
+        # info.json fps (rlwrld_human_lerobot: 30 fps tag, 20 fps rows -> frames read 1.5x too fast and
+        # the last third of every episode frozen on the final frame). DZ_VIDEO_BY_INDEX=0 restores it.
+        if os.environ.get("DZ_VIDEO_BY_INDEX", "1").strip() != "0":
+            return get_frames_by_indices(
+                video_path.as_posix(),
+                np.asarray(step_indices, dtype=np.int64),
+                video_backend=self.video_backend,
+                video_backend_kwargs=self.video_backend_kwargs,
+            )
         timestamp: np.ndarray = self.curr_traj_data["timestamp"].to_numpy()
         # Get the corresponding video timestamps from the step indices
         video_timestamp = timestamp[step_indices]
